@@ -1,7 +1,6 @@
 "use client";
 
 import Chart from "./Chart";
-import QuoteHeader from "./QuoteHeader";
 import { useStore, type Panel } from "@/lib/store";
 import { usePanelData } from "@/lib/usePanelData";
 
@@ -18,7 +17,7 @@ export default function ChartPanel({
 }) {
   const setActivePanel = useStore((s) => s.setActivePanel);
   const market = useStore((s) => s.market);
-  const { candles, quote, loading, error } = usePanelData(
+  const { candles, loading, error } = usePanelData(
     panel.symbol,
     panel.timeframe,
     market,
@@ -33,9 +32,8 @@ export default function ChartPanel({
           : ""
       }`}
     >
-      <QuoteHeader name={panel.name} symbol={panel.symbol} quote={quote} market={market} />
       <div className="relative flex-1 min-h-0">
-        <Chart panel={panel} candles={candles} />
+        <Chart panel={panel} candles={candles} market={market} />
         {loading && (
           <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 text-xs text-[#787b86] bg-[#131722] border border-[#2a2e39] rounded px-3 py-1">
             Loading…

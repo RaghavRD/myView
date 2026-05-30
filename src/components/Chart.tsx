@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createChart,
   ColorType,
@@ -18,7 +18,7 @@ import {
   type Time,
   type LineWidth,
 } from "lightweight-charts";
-import type { Candle } from "@/lib/provider/types";
+import type { Candle, Market, Timeframe } from "@/lib/provider/types";
 import {
   useStore,
   POINTS_PER_TOOL,
@@ -31,6 +31,43 @@ import { DrawingPrimitive } from "@/lib/drawings";
 
 type AnySeries = ISeriesApi<SeriesType>;
 type LineDatum = { time: UTCTimestamp; value: number };
+
+/** Candle duration in seconds, for the price-axis countdown. Weekly/monthly omitted. */
+const TF_SECONDS: Partial<Record<Timeframe, number>> = {
+  "1m": 60,
+  "5m": 300,
+  "15m": 900,
+  "30m": 1800,
+  "1h": 3600,
+  "1D": 86400,
+};
+
+/** Human source label for the legend (TradingView shows the exchange here). */
+function sourceLabel(market: Market): string {
+  return market === "crypto" ? "Binance" : "NSE";
+}
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/** Seconds remaining until the current candle closes, formatted m:ss / h:mm:ss. */
+function countdownFor(tf: Timeframe): string {
+  const dur = TF_SECONDS[tf];
+  if (!dur) return "";
+  const now = Math.floor(Date.now() / 1000);
+  const rem = dur - (now % dur);
+  const h = Math.floor(rem / 3600);
+  const m = Math.floor((rem % 3600) / 60);
+  const s = rem % 60;
+  return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${pad2(m)}:${pad2(s)}`;
+}
+
+/** Price formatter: more decimals for sub-dollar assets, comma grouping above. */
+function fmtPrice(n: number | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  const abs = Math.abs(n);
+  const max = abs >= 1 ? 2 : abs >= 0.01 ? 4 : 6;
+  return n.toLocaleString("en-US", { maximumFractionDigits: max, minimumFractionDigits: 2 });
+}
 
 /** A series plus how to (re)derive its data from candles — lets us update data
  *  in place on every poll instead of tearing the whole chart down (no flicker). */
@@ -61,9 +98,11 @@ function toLine(candles: Candle[], vals: (number | null)[]): LineDatum[] {
 export default function Chart({
   panel,
   candles,
+  market,
 }: {
   panel: Panel;
   candles: Candle[];
+  market: Market;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -79,7 +118,24 @@ export default function Chart({
     panelIdRef.current = panel.id;
   }, [panel.id]);
 
+  // overlay state: crosshair-hovered candle time, last-price y-coordinate, countdown
+  const [hoverTime, setHoverTime] = useState<number | null>(null);
+  const [priceY, setPriceY] = useState<number | null>(null);
+  const [countdown, setCountdown] = useState("");
+
   const { chartType, indicators, drawings, appearance } = panel;
+
+  // glue the right-axis price box to the last close's pixel position
+  const syncPrice = useCallback(() => {
+    const s = mainRef.current;
+    const c = latestCandlesRef.current;
+    if (!s || !c.length) {
+      setPriceY(null);
+      return;
+    }
+    const y = s.priceToCoordinate(c[c.length - 1].close);
+    setPriceY(y == null ? null : y);
+  }, []);
 
   // create the chart once
   useEffect(() => {
@@ -144,8 +200,24 @@ export default function Chart({
     };
     chart.subscribeClick(onClick);
 
+    // track the candle under the crosshair for the legend (debounced by time)
+    let lastHover: number | null = null;
+    const onMove = (param: MouseEventParams<Time>) => {
+      const t = param.time != null && typeof param.time === "number" ? param.time : null;
+      if (t !== lastHover) {
+        lastHover = t;
+        setHoverTime(t);
+      }
+    };
+    chart.subscribeCrosshairMove(onMove);
+
+    // keep the price box pinned as the user scrolls / zooms
+    chart.timeScale().subscribeVisibleLogicalRangeChange(syncPrice);
+
     return () => {
       chart.unsubscribeClick(onClick);
+      chart.unsubscribeCrosshairMove(onMove);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(syncPrice);
       chart.remove();
       chartRef.current = null;
       producersRef.current = [];
@@ -153,6 +225,17 @@ export default function Chart({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // drive the countdown (1s) and re-pin the price box each tick
+  useEffect(() => {
+    const tick = () => {
+      setCountdown(countdownFor(panel.timeframe));
+      syncPrice();
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [panel.timeframe, syncPrice]);
 
   // live-apply background / grid without recreating the chart
   useEffect(() => {
@@ -197,7 +280,11 @@ export default function Chart({
     // ---- main price series ----
     if (chartType === "line") {
       mainRef.current = add(
-        chart.addSeries(LineSeries, { color: appearance.lineColor, lineWidth: 2 }),
+        chart.addSeries(LineSeries, {
+          color: appearance.lineColor,
+          lineWidth: 2,
+          lastValueVisible: false,
+        }),
         (c) => c.map((x) => ({ time: x.time as UTCTimestamp, value: x.close })),
       );
     } else if (chartType === "area") {
@@ -207,6 +294,7 @@ export default function Chart({
           topColor: "rgba(41,98,255,0.30)",
           bottomColor: "rgba(41,98,255,0.02)",
           lineWidth: 2,
+          lastValueVisible: false,
         }),
         (c) => c.map((x) => ({ time: x.time as UTCTimestamp, value: x.close })),
       );
@@ -219,6 +307,7 @@ export default function Chart({
           borderDownColor: appearance.downColor,
           wickUpColor: appearance.upColor,
           wickDownColor: appearance.downColor,
+          lastValueVisible: false,
         }),
         (c) =>
           c.map((x) => ({
@@ -378,7 +467,75 @@ export default function Chart({
       if (candles.length) chart.timeScale().fitContent();
       viewKeyRef.current = key;
     }
-  }, [candles, panel.symbol, panel.timeframe]);
+    syncPrice();
+  }, [candles, panel.symbol, panel.timeframe, syncPrice]);
 
-  return <div ref={containerRef} className="absolute inset-0" />;
+  // ---- legend (OHLC of the hovered candle, else the last candle) ----
+  const last = candles.length ? candles[candles.length - 1] : null;
+  const shown =
+    (hoverTime != null ? candles.find((c) => c.time === hoverTime) : null) ?? last;
+  const shownIdx = shown ? candles.findIndex((c) => c.time === shown.time) : -1;
+  const prevClose = shownIdx > 0 ? candles[shownIdx - 1].close : shown?.open ?? 0;
+  const change = shown ? shown.close - prevClose : 0;
+  const changePct = prevClose ? (change / prevClose) * 100 : 0;
+  const barUp = shown ? shown.close >= shown.open : true;
+  const ohlcColor = barUp ? appearance.upColor : appearance.downColor;
+  const lastUp = last ? last.close >= last.open : true;
+
+  const ohlc = (label: string, value: number | undefined) => (
+    <span className="tabular-nums">
+      <span className="text-[#787b86]">{label}</span>
+      <span style={{ color: ohlcColor }}>{fmtPrice(value)}</span>
+    </span>
+  );
+
+  return (
+    <div ref={containerRef} className="absolute inset-0">
+      {/* top-left legend — symbol · timeframe · source + live OHLC */}
+      <div className="absolute top-2 left-2 z-10 flex flex-col gap-0.5 pointer-events-none select-none">
+        <div className="flex items-center gap-1.5 text-[13px] font-medium text-[#d1d4dc]">
+          <span>{panel.name}</span>
+          <span className="text-[#787b86]">·</span>
+          <span className="text-[#787b86]">{panel.timeframe}</span>
+          <span className="text-[#787b86]">·</span>
+          <span className="text-[#787b86]">{sourceLabel(market)}</span>
+        </div>
+        {shown && (
+          <div className="flex items-center gap-2 text-[12px]">
+            {ohlc("O", shown.open)}
+            {ohlc("H", shown.high)}
+            {ohlc("L", shown.low)}
+            {ohlc("C", shown.close)}
+            <span className="tabular-nums" style={{ color: ohlcColor }}>
+              {change >= 0 ? "+" : ""}
+              {fmtPrice(change)} ({change >= 0 ? "+" : ""}
+              {changePct.toFixed(2)}%)
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* right price-axis box: last price + countdown to candle close */}
+      {last && priceY != null && (
+        <div
+          className="absolute right-0 z-10 flex flex-col items-center px-1.5 py-0.5 rounded-sm pointer-events-none select-none text-white"
+          style={{
+            top: priceY,
+            transform: "translateY(-50%)",
+            background: lastUp ? appearance.upColor : appearance.downColor,
+            minWidth: 60,
+          }}
+        >
+          <span className="text-[12px] font-semibold leading-tight tabular-nums">
+            {fmtPrice(last.close)}
+          </span>
+          {countdown && (
+            <span className="text-[10px] leading-tight tabular-nums opacity-90">
+              {countdown}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
